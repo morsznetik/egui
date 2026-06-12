@@ -520,7 +520,7 @@ impl Window<'_> {
             )
         });
 
-        {
+        let resize_new_rect = {
             let margins = window_frame.total_margin().sum()
                 + vec2(0.0, title_bar_height_with_margin + title_content_spacing);
 
@@ -531,8 +531,8 @@ impl Window<'_> {
                 area_layer_id,
                 &mut area,
                 resize_id,
-            );
-        }
+            )
+        };
 
         let mut area_content_ui = area.content_ui(ctx);
         if is_open {
@@ -649,6 +649,19 @@ impl Window<'_> {
         };
 
         let full_response = area.end(ctx, area_content_ui);
+
+        // area.end() overwrites state.size with content_ui.min_size(), but during a resize
+        // drag the content may not fill the full desired width (e.g. no ScrollArea).
+        // Re-store the correct size that was computed by resize_response.
+        if let Some(ref new_rect) = resize_new_rect {
+            if resize_interaction.any_dragged() {
+                let old_state = ctx.memory(|m| m.areas().get(area_id).copied());
+                if let Some(mut state) = old_state {
+                    state.size = Some(new_rect.size());
+                    ctx.memory_mut(|m| m.areas_mut().set_state(area_layer_id, state));
+                }
+            }
+        }
 
         let inner_response = InnerResponse {
             inner: content_inner,
@@ -826,17 +839,20 @@ fn resize_response(
     area_layer_id: LayerId,
     area: &mut area::Prepared,
     resize_id: Id,
-) {
-    let Some(mut new_rect) = move_and_resize_window(ctx, &resize_interaction) else {
-        return;
+) -> Option<Rect> {
+    let Some(mut new_rect) = move_and_resize_window(ctx, resize_id, &resize_interaction) else {
+        return None;
     };
 
     if area.constrain() {
         new_rect = Context::constrain_window_rect_to_area(new_rect, area.constrain_rect());
     }
 
-    // TODO(emilk): add this to a Window state instead as a command "move here next frame"
+    // Set both position and size so the window displays correctly this frame,
+    // rather than relying on area.end() which sizes from content_ui.min_size()
+    // (content may not fill the full desired width when ScrollArea is disabled).
     area.state_mut().set_left_top_pos(new_rect.left_top());
+    area.state_mut().size = Some(new_rect.size());
 
     if resize_interaction.any_dragged() {
         if let Some(mut state) = resize::State::load(ctx, resize_id) {
@@ -846,36 +862,54 @@ fn resize_response(
     }
 
     ctx.memory_mut(|mem| mem.areas_mut().move_to_top(area_layer_id));
+    Some(new_rect)
 }
 
 /// Acts on outer rect (outside the stroke)
-fn move_and_resize_window(ctx: &Context, interaction: &ResizeInteraction) -> Option<Rect> {
+fn move_and_resize_window(
+    ctx: &Context,
+    id: Id,
+    interaction: &ResizeInteraction,
+) -> Option<Rect> {
+    let rect_at_start_of_drag_id = id.with("window_rect_at_drag_start");
+
     if !interaction.any_dragged() {
+        ctx.data_mut(|data| {
+            data.remove::<Rect>(rect_at_start_of_drag_id);
+        });
         return None;
     }
 
-    let pointer_pos = ctx.input(|i| i.pointer.interact_pos())?;
-    let mut rect = interaction.outer_rect; // prevent drift
+    let press_origin = ctx.input(|i| i.pointer.press_origin())?;
+    let current_pos = ctx.input(|i| i.pointer.interact_pos())?;
+    let total_drag_delta = current_pos - press_origin;
+
+    let rect_at_start_of_drag = ctx.data_mut(|data| {
+        *data.get_temp_mut_or::<Rect>(rect_at_start_of_drag_id, interaction.outer_rect)
+    });
+
+    let mut rect = rect_at_start_of_drag; // prevent drift
 
     // Put the rect in the center of the stroke:
     rect = rect.shrink(interaction.window_frame.stroke.width / 2.0);
 
     if interaction.left.drag {
-        rect.min.x = pointer_pos.x;
+        rect.min.x += total_drag_delta.x;
     } else if interaction.right.drag {
-        rect.max.x = pointer_pos.x;
+        rect.max.x += total_drag_delta.x;
     }
 
     if interaction.top.drag {
-        rect.min.y = pointer_pos.y;
+        rect.min.y += total_drag_delta.y;
     } else if interaction.bottom.drag {
-        rect.max.y = pointer_pos.y;
+        rect.max.y += total_drag_delta.y;
     }
 
     // Return to having the rect outside the stroke:
     rect = rect.expand(interaction.window_frame.stroke.width / 2.0);
 
-    Some(rect.round_ui())
+    let result = rect.round_ui();
+    Some(result)
 }
 
 fn resize_interaction(
@@ -938,31 +972,23 @@ fn resize_interaction(
     // Check sides first, so that corners are on top, covering the sides (i.e. corners have priority)
 
     if possible.resize_right {
-        let response = side_response(
-            vetrtical_rect(rect.right_top(), rect.right_bottom()),
-            id.with("right"),
-        );
+        let r = vetrtical_rect(rect.right_top(), rect.right_bottom());
+        let response = side_response(r, id.with("right"));
         right |= response;
     }
     if possible.resize_left {
-        let response = side_response(
-            vetrtical_rect(rect.left_top(), rect.left_bottom()),
-            id.with("left"),
-        );
+        let r = vetrtical_rect(rect.left_top(), rect.left_bottom());
+        let response = side_response(r, id.with("left"));
         left |= response;
     }
     if possible.resize_bottom {
-        let response = side_response(
-            horizontal_rect(rect.left_bottom(), rect.right_bottom()),
-            id.with("bottom"),
-        );
+        let r = horizontal_rect(rect.left_bottom(), rect.right_bottom());
+        let response = side_response(r, id.with("bottom"));
         bottom |= response;
     }
     if possible.resize_top {
-        let response = side_response(
-            horizontal_rect(rect.left_top(), rect.right_top()),
-            id.with("top"),
-        );
+        let r = horizontal_rect(rect.left_top(), rect.right_top());
+        let response = side_response(r, id.with("top"));
         top |= response;
     }
 
@@ -975,7 +1001,8 @@ fn resize_interaction(
     // the whole corner is grabbable:
 
     if possible.resize_right || possible.resize_bottom {
-        let response = side_response(corner_rect(rect.right_bottom()), id.with("right_bottom"));
+        let r = corner_rect(rect.right_bottom());
+        let response = side_response(r, id.with("right_bottom"));
         if possible.resize_right {
             right |= response;
         }
@@ -985,7 +1012,8 @@ fn resize_interaction(
     }
 
     if possible.resize_right || possible.resize_top {
-        let response = side_response(corner_rect(rect.right_top()), id.with("right_top"));
+        let r = corner_rect(rect.right_top());
+        let response = side_response(r, id.with("right_top"));
         if possible.resize_right {
             right |= response;
         }
@@ -995,7 +1023,8 @@ fn resize_interaction(
     }
 
     if possible.resize_left || possible.resize_bottom {
-        let response = side_response(corner_rect(rect.left_bottom()), id.with("left_bottom"));
+        let r = corner_rect(rect.left_bottom());
+        let response = side_response(r, id.with("left_bottom"));
         if possible.resize_left {
             left |= response;
         }
@@ -1005,7 +1034,8 @@ fn resize_interaction(
     }
 
     if possible.resize_left || possible.resize_top {
-        let response = side_response(corner_rect(rect.left_top()), id.with("left_top"));
+        let r = corner_rect(rect.left_top());
+        let response = side_response(r, id.with("left_top"));
         if possible.resize_left {
             left |= response;
         }
